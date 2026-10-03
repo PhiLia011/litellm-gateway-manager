@@ -82,6 +82,11 @@ setx PYTHONUTF8 1
 setx PYTHONIOENCODING utf-8
 setx LITELLM_LOCAL_MODEL_COST_MAP True
 
+# 4b) 如果开着代理（Clash / v2ray 等），本机地址必须绕过代理，否则 Codex 会收到 502
+setx NO_PROXY "127.0.0.1,localhost"
+#    原本已有值的话保留原值再补，例如：
+#    setx NO_PROXY "127.0.0.1,localhost,api.deepseek.com"
+
 # 5) 生成网关自身的鉴权 key
 $k = "sk-" + (-join (1..48 | ForEach-Object { "0123456789abcdefghijklmnopqrstuvwxyz"[(Get-Random -Maximum 36)] }))
 setx LITELLM_MASTER_KEY $k
@@ -250,6 +255,19 @@ config.yaml      ← 【生成物】喂给 LiteLLM，请勿手工修改
    会抛 `UnicodeDecodeError`。所以要 `PYTHONUTF8=1`。
 7. **LiteLLM 启动时会去 GitHub 拉价格表**，在国内经常失败并重试 3 次（白等约 10 秒）。
    `LITELLM_LOCAL_MODEL_COST_MAP=True` 可跳过。
+8. **开了代理（Clash / v2ray 等）时，Codex 会把发往本机网关的请求也丢给代理，得到 502。**
+   这个症状极其迷惑：Codex 报
+   `502 Bad Gateway: url: http://127.0.0.1:4000/v1/responses`，
+   但**网关日志里完全没有这条请求** —— 因为它根本没到网关，被代理拦下了。
+   处理：把回环地址加进 `NO_PROXY`（本地地址永远不该走代理）：
+
+   ```powershell
+   setx NO_PROXY "127.0.0.1,localhost"
+   # 若原本已有值，保留原值再补上，例如：
+   # setx NO_PROXY "127.0.0.1,localhost,api.deepseek.com"
+   ```
+
+   注意环境变量是**进程启动时**读取的，设完要重开终端 / 重启 Codex。
 
 ---
 
@@ -262,6 +280,7 @@ config.yaml      ← 【生成物】喂给 LiteLLM，请勿手工修改
 | 401 / Unauthorized | 当前终端没有 `LITELLM_MASTER_KEY`；**新开终端**或重新登录 |
 | 上游 403 `Free quota exhausted` | **厂商额度问题，不是网关问题**：充值或关掉"仅用免费额度" |
 | 加厂商探测两种都失败 | 密钥不对 / 接口地址写错 / 该家不支持这两种协议 |
+| **Codex 报 502，但网关日志里没有这条请求** | 代理把本机请求也拦截了 → 把 `127.0.0.1,localhost` 加进 `NO_PROXY`（见踩坑 8） |
 | 启动慢约 10 秒 | `LITELLM_LOCAL_MODEL_COST_MAP=True` 丢了 |
 | 启动报 `UnicodeDecodeError: 'gbk'` | `PYTHONUTF8=1` 丢了 |
 
