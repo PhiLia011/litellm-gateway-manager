@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "说明": "厂商清单 —— 这是【示例文件】。首次运行网关管家时，它会自动复制成 providers.json。config.yaml 由网关管家根据本文件自动生成，请不要手工修改 config.yaml。密钥只存环境变量名，不存明文。",
+  "providers": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek 官方",
+      "baseUrl": "https://api.deepseek.com",
+      "envKey": "DEEPSEEK_API_KEY",
+      "wireMode": "responses",
+      "models": [
+        { "alias": "deepseek-chat", "upstream": "deepseek-chat" }
+      ]
+    },
+    {
+      "id": "bailian",
+      "name": "阿里云百炼（Qwen）",
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "envKey": "DASHSCOPE_API_KEY",
+      "wireMode": "responses",
+      "models": [
+        { "alias": "qwen-max", "upstream": "qwen-max" }
+      ]
+    },
+    {
+      "id": "zai",
+      "name": "智谱 GLM",
+      "baseUrl": "https://open.bigmodel.cn/api/v1",
+      "envKey": "ZAI_API_KEY",
+      "wireMode": "responses",
+      "models": [
+        { "alias": "glm-4.6", "upstream": "glm-4.6" }
+      ]
+    }
+  ]
+}

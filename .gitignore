@@ -1,0 +1,17 @@
+# 运行时数据 —— 不进仓库
+providers.json
+config.yaml
+logs/
+*.log
+gateway-*.log
+
+# 备份与临时文件
+*.bak
+*.tmp
+*.1
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

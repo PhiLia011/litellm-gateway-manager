@@ -1,0 +1,17 @@
+# 统一换行符，避免跨平台克隆时出问题
+* text=auto
+
+# Windows 批处理必须用 CRLF：LF-only 的 .cmd 在部分 cmd 解析场景下会出错
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.vbs text eol=crlf
+
+# 文档和配置用 LF
+*.md   text eol=lf
+*.json text eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
