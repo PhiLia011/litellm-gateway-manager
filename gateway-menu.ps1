@@ -289,19 +289,23 @@ function Show-Status {
 }
 
 function Test-AllModels {
-    if (-not (Test-Online)) { Write-Host "`n  网关没运行，先用主菜单第 6 项启动它。`n" -ForegroundColor Red; return }
+    if (-not (Test-Online)) { Write-Host "`n  网关没运行，先用主菜单里的「启动 / 重启网关」。`n" -ForegroundColor Red; return }
     $reg = Load-Registry
     Write-Host "`n  正在逐个实测（每个一次真实请求，可能要十几秒）...`n"
+    $failed = @()
     foreach ($m in (Get-AllAliases $reg)) {
         $r = Test-OneModel $m
         if ($r.ok) {
             Write-Host ("  v {0,-20} 正常" -f $m) -ForegroundColor Green
         } else {
+            $why = Explain-Error $r.msg
             Write-Host ("  x {0,-20} 失败" -f $m) -ForegroundColor Red
-            Write-Host ("      -> {0}" -f (Explain-Error $r.msg)) -ForegroundColor Yellow
+            Write-Host ("      -> {0}" -f $why) -ForegroundColor Yellow
+            $failed += [PSCustomObject]@{ alias = $m; reason = $why }
         }
     }
     Write-Host ""
+    if ($failed.Count -gt 0) { Invoke-FailedCleanup $failed }
 }
 
 function Switch-DefaultModel {
@@ -736,6 +740,212 @@ function Show-KeyMenu {
 }
 
 # ============================================================
+#  功能三：清理用不了的模型 / 同步 Codex 的模型列表
+# ============================================================
+
+# Codex 的模型清单来自 config.toml 里 model_catalog_json 指向的文件；
+# App 的模型选择器就是照着它列的。所以"删掉 App 里的旧模型"= 删这个文件里的条目。
+function Get-CodexCatalogPath {
+    if (Test-Path $CodexToml) {
+        foreach ($line in (Get-Content $CodexToml -Encoding UTF8)) {
+            if ($line -match '^\s*model_catalog_json\s*=\s*"([^"]+)"') {
+                return ($Matches[1] -replace '/', '\')
+            }
+        }
+    }
+    return (Join-Path (Split-Path $CodexToml) "models.json")
+}
+
+function Read-CodexCatalog([string]$path) {
+    $j = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    return @($j.models)
+}
+
+# 写回前先备份，写回后立刻校验；校验不过就回滚到本次快照
+function Save-CodexCatalog([string]$path, $models) {
+    # 每次都留一份带时间戳的快照；.bak 只在第一次创建，
+    # 这样 .bak 永远是"改动前"最原始的那一份，不会被后续写入覆盖
+    $stamp    = Get-Date -Format "yyyyMMdd-HHmmss"
+    $snapshot = "$path.$stamp.bak"
+    Copy-Item $path $snapshot -Force
+    if (-not (Test-Path "$path.bak")) { Copy-Item $path "$path.bak" -Force }
+
+    $obj  = [PSCustomObject]@{ models = @($models) }
+    $json = $obj | ConvertTo-Json -Depth 100
+    [IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding($false)))
+
+    # 校验：Codex 会因为"字段根本不存在"而拒绝整个文件。
+    # 注意必须判断【字段是否存在】，不能判断"值是否非空" ——
+    # 空字符串 base_instructions 是完全合法的（本项目里就有 10 个是这样的）。
+    try {
+        $check = Read-CodexCatalog $path
+        if (@($check).Count -ne @($models).Count) { throw "写入后条目数不一致" }
+        foreach ($m in @($check)) {
+            $hasBase = $m.PSObject.Properties.Name -contains 'base_instructions'
+            $hasTmpl = $false
+            if ($m.model_messages) { $hasTmpl = $m.model_messages.PSObject.Properties.Name -contains 'instructions_template' }
+            if (-not $hasBase -and -not $hasTmpl) { throw "条目 $($m.slug) 两个字段都没有，Codex 会拒绝加载整个文件" }
+        }
+    } catch {
+        Copy-Item $snapshot $path -Force
+        throw "$($_.Exception.Message)；已回滚（快照：$snapshot）"
+    }
+    return $true
+}
+
+function Remove-CatalogSlugs([string]$path, [string[]]$slugs) {
+    $models = Read-CodexCatalog $path
+    $keep = @($models | Where-Object { $_.slug -notin $slugs })
+    $removed = @($models).Count - @($keep).Count
+    if ($removed -le 0) { Write-Host "  （模型列表里没有这些条目，无需改动）" -ForegroundColor DarkGray; return 0 }
+    Save-CodexCatalog $path $keep | Out-Null
+    Write-Host ("  v 已从 Codex 模型列表移除 {0} 个条目（原文件备份为 models.json.bak）" -f $removed) -ForegroundColor Green
+    return $removed
+}
+
+# 给网关里有、但 Codex 列表里没有的模型补条目（否则 Codex 用通用参数兜底）
+function Add-CatalogEntries([string]$path, [string[]]$aliases) {
+    $models = Read-CodexCatalog $path
+    if (@($models).Count -eq 0) { Write-Host "  x 列表为空，没有可参照的模板，已跳过" -ForegroundColor Red; return 0 }
+    $reg = Load-Registry
+    $added = 0
+    foreach ($a in $aliases) {
+        $owner = Get-AliasOwner $reg $a
+        $template = $null
+        if ($owner) {
+            foreach ($m in @($owner.models)) {
+                $t = $models | Where-Object { $_.slug -eq $m.alias } | Select-Object -First 1
+                if ($t) { $template = $t; break }
+            }
+        }
+        if (-not $template) { $template = @($models)[0] }
+        $copy = $template | ConvertTo-Json -Depth 100 | ConvertFrom-Json
+        $copy.slug = $a
+        $copy.display_name = $a
+        $copy.description = "由网关管家自动生成：参数沿用 $($template.slug)，可按需修改"
+        $models = @($models) + $copy
+        Write-Host ("  v 已补充条目 {0}（参数模板：{1}）" -f $a, $template.slug) -ForegroundColor Green
+        $added++
+    }
+    if ($added -gt 0) { Save-CodexCatalog $path $models | Out-Null }
+    return $added
+}
+
+# 从网关移除若干模型；顺带清掉已经没有模型的厂商
+function Remove-GatewayModels([string[]]$aliases) {
+    $reg = Load-Registry
+    $before = @(Get-AllAliases $reg).Count
+    foreach ($p in $reg.providers) {
+        $p.models = @(@($p.models) | Where-Object { $_.alias -notin $aliases })
+    }
+    $emptied = @($reg.providers | Where-Object { @($_.models).Count -eq 0 })
+    $reg.providers = @($reg.providers | Where-Object { @($_.models).Count -gt 0 })
+    Save-Registry $reg
+    Write-ConfigYaml $reg
+    $after = @(Get-AllAliases $reg).Count
+    Write-Host ("  v 已从网关移除 {0} 个模型（{1} -> {2}）" -f ($before - $after), $before, $after) -ForegroundColor Green
+    foreach ($e in $emptied) {
+        Write-Host ("  i 厂商「{0}」已没有模型，一并移除（它用的环境变量保留，没有删）" -f $e.name) -ForegroundColor DarkGray
+    }
+    return $after
+}
+
+# 测试失败后的处理入口
+function Invoke-FailedCleanup($failed) {
+    Write-Host ("  ! 有 {0} 个模型用不了：" -f @($failed).Count) -ForegroundColor Yellow
+    for ($i = 0; $i -lt @($failed).Count; $i++) {
+        Write-Host ("   {0}. {1,-20} {2}" -f ($i + 1), $failed[$i].alias, $failed[$i].reason) -ForegroundColor DarkYellow
+    }
+    Write-Host ""
+    Write-Host "    1. 全部删除（从网关移除，Codex 里也就选不到了）"
+    Write-Host "    2. 选择要删的"
+    Write-Host "    0. 都不删"
+    Write-Host ""
+    $c = Read-Host "  请选择"
+
+    $targets = @()
+    switch ($c) {
+        "1" { $targets = @($failed | ForEach-Object { $_.alias }) }
+        "2" {
+            $ans = Read-Host "  输入要删的序号（多个用逗号分隔，如 1,3,5）"
+            foreach ($t in ($ans -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+                $n = [int]$t
+                if ($n -ge 1 -and $n -le @($failed).Count) { $targets += $failed[$n - 1].alias }
+            }
+            if (@($targets).Count -eq 0) { Write-Host "  没有选中任何模型，已取消`n" -ForegroundColor Yellow; return }
+        }
+        default { return }
+    }
+    if (@($targets).Count -eq 0) { return }
+
+    Write-Host ""
+    Write-Host ("  将要删除：{0}" -f ($targets -join ', ')) -ForegroundColor Yellow
+    if (-not (Confirm "确定吗？（删掉的只是网关里的登记项，随时可以再加回来）")) { return }
+
+    $left = Remove-GatewayModels $targets
+    if ($left -eq 0) {
+        Write-Host "  ! 网关里一个模型都不剩了，Codex 会全部报错，请尽快到「厂商与模型管理」加回来" -ForegroundColor Red
+    }
+
+    # 同步 Codex App 的模型列表，否则 App 里还显示这些、选了报错
+    $path = Get-CodexCatalogPath
+    if (Test-Path $path) {
+        if (Confirm "同时从 Codex App 的模型列表(models.json)里也移除它们吗？") {
+            try { Remove-CatalogSlugs $path $targets | Out-Null }
+            catch { Write-Host "  x 写模型列表失败：$($_.Exception.Message)" -ForegroundColor Red }
+        }
+    }
+
+    if (Confirm "现在重启网关让改动生效吗？") {
+        Write-Host "  正在重启..." -ForegroundColor DarkGray
+        if (Restart-Gateway) { Write-Host "  v 网关已重启`n" -ForegroundColor Green }
+        else { Write-Host "  x 重启失败，看日志`n" -ForegroundColor Red }
+    }
+    Write-Host ""
+}
+
+# 独立的"同步 Codex 模型列表"入口
+function Sync-CodexCatalog {
+    $path = Get-CodexCatalogPath
+    Write-Host "`n  Codex 模型列表：$path"
+    if (-not (Test-Path $path)) { Write-Host "  x 文件不存在（config.toml 里没有 model_catalog_json？）`n" -ForegroundColor Red; return }
+
+    $models  = Read-CodexCatalog $path
+    $aliases = Get-AllAliases (Load-Registry)
+    $slugs   = @($models | ForEach-Object { $_.slug })
+
+    Write-Host ("  文件里 {0} 个条目，网关里 {1} 个模型`n" -f @($models).Count, @($aliases).Count)
+
+    $dead    = @($slugs | Where-Object { $_ -notin $aliases })
+    $missing = @($aliases | Where-Object { $_ -notin $slugs })
+
+    if ($dead.Count -gt 0) {
+        Write-Host "  【多余的】App 里能选、网关里没有（选了必然失败）：" -ForegroundColor Yellow
+        $dead | ForEach-Object { Write-Host ("    - {0}" -f $_) -ForegroundColor DarkYellow }
+        if (Confirm "  把它们从 Codex 模型列表里移除吗？") {
+            try { Remove-CatalogSlugs $path $dead | Out-Null }
+            catch { Write-Host "  x 失败：$($_.Exception.Message)" -ForegroundColor Red }
+        }
+    } else {
+        Write-Host "  v 没有多余的条目" -ForegroundColor Green
+    }
+
+    if ($missing.Count -gt 0) {
+        Write-Host "`n  【缺少的】网关里有、App 列表里没有（Codex 会用通用参数兜底）：" -ForegroundColor Yellow
+        $missing | ForEach-Object { Write-Host ("    - {0}" -f $_) -ForegroundColor DarkYellow }
+        if (Confirm "  要给它们补上条目吗？（参数复制自同厂商的其它模型，可自行修改）") {
+            try { Add-CatalogEntries $path $missing | Out-Null }
+            catch { Write-Host "  x 失败：$($_.Exception.Message)" -ForegroundColor Red }
+        }
+    } else {
+        Write-Host "`n  v 没有缺少的条目" -ForegroundColor Green
+    }
+
+    Write-Host "`n  i 改完后 Codex App 可能需要重启才会刷新模型选择器" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+# ============================================================
 #  非交互模式（脚本化 / 自动化测试用）
 # ============================================================
 
@@ -769,15 +979,16 @@ while ($true) {
     Write-Host "     默认模型：$default" -ForegroundColor Gray
     Write-Host ""
     Write-Host "    1. 查看状态和可用模型"
-    Write-Host "    2. 测试每个模型能不能用（推荐先用这个）"
+    Write-Host "    2. 测试每个模型能不能用（失败的可当场清理）"
     Write-Host "    3. 切换 Codex 默认模型"
     Write-Host "    4. 厂商与模型管理  << 加厂商 / 加模型" -ForegroundColor White
     Write-Host "    5. 密钥管理        << 加 key / 换 key" -ForegroundColor White
-    Write-Host "    6. 启动 / 重启网关"
-    Write-Host "    7. 停止网关"
-    Write-Host "    8. 查看最近日志"
-    Write-Host "    9. 快速上手说明"
-    Write-Host "   10. 打开配置文件夹"
+    Write-Host "    6. 清理 Codex App 里的旧模型  << 同步模型列表" -ForegroundColor White
+    Write-Host "    7. 启动 / 重启网关"
+    Write-Host "    8. 停止网关"
+    Write-Host "    9. 查看最近日志"
+    Write-Host "   10. 快速上手说明"
+    Write-Host "   11. 打开配置文件夹"
     Write-Host "    0. 退出"
     Write-Host ""
 
@@ -789,7 +1000,8 @@ while ($true) {
         "3"  { Switch-DefaultModel; Read-Host "  按回车返回" | Out-Null }
         "4"  { Show-ProviderMenu }
         "5"  { Show-KeyMenu }
-        "6"  {
+        "6"  { Sync-CodexCatalog;   Read-Host "  按回车返回" | Out-Null }
+        "7"  {
             if (Test-Online) {
                 Write-Host "`n  网关正在运行。" -ForegroundColor Yellow
                 if (Confirm "要重启它吗？") {
@@ -804,7 +1016,7 @@ while ($true) {
             }
             Read-Host "  按回车返回" | Out-Null
         }
-        "7"  {
+        "8"  {
             if (-not (Test-Online)) { Write-Host "`n  网关本来就没运行。`n" -ForegroundColor Yellow }
             elseif (Confirm "确定停止网关吗？Codex 会立刻用不了") {
                 Stop-GatewayProcess
@@ -813,9 +1025,9 @@ while ($true) {
             }
             Read-Host "  按回车返回" | Out-Null
         }
-        "8"  { Show-Logs;           Read-Host "  按回车返回" | Out-Null }
-        "9"  { Show-QuickStart;     Read-Host "  按回车返回" | Out-Null }
-        "10" { Invoke-Item $Root }
+        "9"  { Show-Logs;           Read-Host "  按回车返回" | Out-Null }
+        "10" { Show-QuickStart;     Read-Host "  按回车返回" | Out-Null }
+        "11" { Invoke-Item $Root }
         # 注意：这里必须用 return，不能用 break。
         # break 在 switch 里只跳出 switch，外层 while 会继续转，变成死循环。
         "0"  { return }

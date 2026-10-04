@@ -147,17 +147,67 @@ Register-ScheduledTask -TaskName "LiteLLM-Gateway" -Action $action -Trigger $tri
      默认模型：deepseek-chat
 
     1. 查看状态和可用模型
-    2. 测试每个模型能不能用（推荐先用这个）
+    2. 测试每个模型能不能用（失败的可当场清理）
     3. 切换 Codex 默认模型
     4. 厂商与模型管理  << 加厂商 / 加模型
     5. 密钥管理        << 加 key / 换 key
-    6. 启动 / 重启网关
-    7. 停止网关
-    8. 查看最近日志
-    9. 快速上手说明
-   10. 打开配置文件夹
+    6. 清理 Codex App 里的旧模型  << 同步模型列表
+    7. 启动 / 重启网关
+    8. 停止网关
+    9. 查看最近日志
+   10. 快速上手说明
+   11. 打开配置文件夹
     0. 退出
 ```
+
+### 清理用不了的模型（`2`）
+
+`2` 会逐个发真实请求，把失败的挑出来并给出中文原因，然后可以直接删：
+
+```
+  v deepseek-flash       正常
+  x kimi-k3              失败
+      -> 上游额度不足/欠费 —— 去对应厂商控制台充值，或关掉「仅用免费额度」模式
+
+  ! 有 1 个模型用不了：
+   1. kimi-k3              上游额度不足/欠费 —— …
+
+    1. 全部删除（从网关移除，Codex 里也就选不到了）
+    2. 选择要删的
+    0. 都不删
+```
+
+删掉的只是**网关里的登记项**，随时可以在「厂商与模型管理」里加回来。
+如果某个厂商的模型被删光了，它会连厂商一起清理（密钥环境变量保留）。
+
+### 清理 Codex App 里的旧模型（`6`）
+
+**Codex App / CLI 的模型选择器读的是 `~/.codex/models.json`**（由 `config.toml`
+里的 `model_catalog_json` 指定）。如果你的模型清单和网关不同步，App 里就会堆着
+一堆"能选但选了必然报错"的旧模型，而 App 本身没有删除入口。
+
+`6` 会双向比对并给出方案：
+
+```
+  文件里 12 个条目，网关里 6 个模型
+
+  【多余的】App 里能选、网关里没有（选了必然失败）：
+    - qwen3.8-max-0902
+    - glm-5.3
+    - qwen3.8-flash
+    ...
+  把它们从 Codex 模型列表里移除吗？ (y/N)
+
+  【缺少的】网关里有、App 列表里没有（Codex 会用通用参数兜底）：
+    - qwen3.8-27b
+  要给它们补上条目吗？（参数复制自同厂商的其它模型） (y/N)
+```
+
+- 写回前自动备份：`.bak`（最早那一份）+ `models.json.<时间戳>.bak`
+- 写回后自动校验，**校验不过会立刻回滚**（Codex 对格式很挑，宁可不动）
+- 改完可能需要重启 Codex App 才会刷新选择器
+
+> 「测试 → 清理」里也会问你要不要**顺带同步** `models.json`，不用手动来两遍。
 
 ### 加一家新厂商（`4` → `2`）
 
@@ -216,6 +266,13 @@ config.yaml      ← 【生成物】喂给 LiteLLM，请勿手工修改
 - `upstream` —— 厂商文档里的真实 model id
 - `wireMode` —— `responses`（原生透传）或 `chat`（桥接）；菜单会自动探测
 
+### Codex 侧的模型清单
+
+`~/.codex/models.json` 是**另一份**清单，由 `~/.codex/config.toml` 的
+`model_catalog_json` 指向。Codex App / CLI 的模型选择器就是照着它列的，
+它决定「下拉框里有哪些模型、各自的上下文窗口和推理档位」。
+本工具不生成它，只在菜单 `6` 里帮你**双向对齐**（多余的删掉、缺少的补上）。
+
 ---
 
 ## 安全说明
@@ -268,6 +325,18 @@ config.yaml      ← 【生成物】喂给 LiteLLM，请勿手工修改
    ```
 
    注意环境变量是**进程启动时**读取的，设完要重开终端 / 重启 Codex。
+9. **改 `~/.codex/models.json` 时，判断"字段是否存在"，别判断"值是否非空"。**
+   Codex 要求每个条目必须带 `base_instructions` 或
+   `model_messages.instructions_template`，缺了整个文件都会被拒绝加载。
+   但 **`base_instructions: ""`（空字符串）是完全合法的** —— 很多条目的推理
+   指令是空的。用 `if (-not $m.base_instructions)` 去校验会把一堆合法条目误判成
+   非法。正确写法：
+
+   ```powershell
+   $hasBase = $m.PSObject.Properties.Name -contains 'base_instructions'
+   $hasTmpl = $false
+   if ($m.model_messages) { $hasTmpl = $m.model_messages.PSObject.Properties.Name -contains 'instructions_template' }
+   ```
 
 ---
 
@@ -299,6 +368,8 @@ config.yaml      ← 【生成物】喂给 LiteLLM，请勿手工修改
 
 providers.json            ← 你的真实厂商清单（不入仓库）
 config.yaml               ← 自动生成（不入仓库）
+~/.codex/models.json      ← Codex 的模型清单（在别处，菜单 6 帮你对齐）
+~/.codex/models.json*.bak ← 改它之前自动留的备份
 ```
 
 ---
