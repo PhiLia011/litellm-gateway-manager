@@ -186,6 +186,23 @@ function New-ConfigYamlText($reg) {
     $L.Add("  drop_params: true")
     $L.Add("  # 长 agent 回合：单次请求给足时间（秒）")
     $L.Add("  request_timeout: 6000")
+
+    # 故障转移：主模型报错（欠费、超时、上游 5xx…）时，按顺序自动改用它后面的模型
+    $fb = @()
+    foreach ($p in $reg.providers) {
+        foreach ($m in @($p.models)) {
+            if ($m.PSObject.Properties.Name -notcontains 'fallbacks') { continue }
+            $list = @($m.fallbacks | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($list.Count -eq 0) { continue }
+            $quoted = ($list | ForEach-Object { '"' + $_ + '"' }) -join ', '
+            $fb += '{"' + $m.alias + '": [' + $quoted + ']}'
+        }
+    }
+    if ($fb.Count -gt 0) {
+        $L.Add("  # 故障转移：主模型报错时按顺序尝试这些备用模型")
+        $L.Add("  fallbacks: [" + ($fb -join ', ') + "]")
+    }
+
     $L.Add("")
     return ($L -join "`r`n")
 }
@@ -444,7 +461,12 @@ function Show-ProviderList {
         Write-Host ("       密钥   {0}  [{1}]" -f $p.envKey, $kstate)
         Write-Host ("       协议   {0}" -f $mode)
         Write-Host  "       模型"
-        foreach ($m in @($p.models)) { Write-Host ("         · {0,-20} -> {1}" -f $m.alias, $m.upstream) }
+        foreach ($m in @($p.models)) {
+            $fb = @()
+            if ($m.PSObject.Properties.Name -contains 'fallbacks') { $fb = @($m.fallbacks | Where-Object { $_ }) }
+            $tag = if ($fb.Count -gt 0) { "   [备用: " + ($fb -join ' -> ') + "]" } else { "" }
+            Write-Host ("         · {0,-20} -> {1}{2}" -f $m.alias, $m.upstream, $tag)
+        }
         Write-Host ""
         $i++
     }
@@ -676,6 +698,92 @@ function Remove-Provider {
     Write-Host ""
 }
 
+# 给某个模型写入 fallbacks（列表为空 = 清除）。
+# 用 Add-Member 是因为老数据里可能根本没有这个字段，直接赋值不保险。
+function Set-ModelFallbacks($m, [string[]]$list) {
+    $clean = @($list | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($m.PSObject.Properties.Name -contains 'fallbacks') {
+        $m.fallbacks = $clean
+    } else {
+        $m | Add-Member -NotePropertyName fallbacks -NotePropertyValue $clean -Force
+    }
+}
+
+function Get-ModelFallbacks($reg, [string]$alias) {
+    foreach ($p in $reg.providers) {
+        foreach ($m in @($p.models)) {
+            if ($m.alias -eq $alias -and $m.PSObject.Properties.Name -contains 'fallbacks') {
+                return @($m.fallbacks | Where-Object { $_ })
+            }
+        }
+    }
+    return @()
+}
+
+# 给一个指定模型配置备用模型（主模型报错时按顺序顶上）
+function Set-FallbackInteractive([string]$alias) {
+    $reg   = Load-Registry
+    $owner = Get-AliasOwner $reg $alias
+    if (-not $owner) { Write-Host "  x 找不到模型 $alias" -ForegroundColor Red; return }
+
+    $cur    = Get-ModelFallbacks $reg $alias
+    $others = @(Get-AllAliases $reg | Where-Object { $_ -ne $alias })
+
+    Write-Host ("`n  给【{0}】设备用模型：它报错（欠费/超时/上游 5xx）时自动按顺序改用后面的。`n" -f $alias) -ForegroundColor Cyan
+    Write-Host ("  当前：{0}" -f $(if ($cur.Count) { $cur -join '  ->  ' } else { '（没配）' })) -ForegroundColor DarkGray
+    Write-Host ""
+    for ($i = 0; $i -lt $others.Count; $i++) { Write-Host ("    {0}. {1}" -f ($i + 1), $others[$i]) }
+    Write-Host "`n  输入序号（多个用逗号分隔，按输入顺序生效）；直接回车 = 清除备用模型"
+    $ans = Read-Host "  请选择"
+
+    $picked = @()
+    if (-not [string]::IsNullOrWhiteSpace($ans)) {
+        foreach ($t in ($ans -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
+            $n = [int]$t
+            if ($n -ge 1 -and $n -le $others.Count) { $picked += $others[$n - 1] }
+        }
+        if ($picked.Count -eq 0) { Write-Host "  没有选中任何模型，已取消`n" -ForegroundColor Yellow; return }
+    }
+
+    foreach ($p in $reg.providers) {
+        foreach ($m in @($p.models)) { if ($m.alias -eq $alias) { Set-ModelFallbacks $m $picked } }
+    }
+    Save-Registry $reg
+    Write-ConfigYaml $reg
+
+    if ($picked.Count -eq 0) { Write-Host "  v 已清除 $alias 的备用模型`n" -ForegroundColor Green }
+    else { Write-Host ("  v 已设置：{0}  ->  {1}" -f $alias, ($picked -join '  ->  ')) -ForegroundColor Green }
+
+    if (Test-Online) {
+        if (Confirm "现在重启网关让改动生效吗？") {
+            Write-Host "  正在重启..." -ForegroundColor DarkGray
+            if (Restart-Gateway) { Write-Host "  v 网关已重启`n" -ForegroundColor Green }
+            else { Write-Host "  x 重启失败，看日志`n" -ForegroundColor Red }
+        }
+    }
+    Write-Host ""
+}
+
+function Manage-Fallbacks {
+    $reg = Load-Registry
+    $aliases = Get-AllAliases $reg
+    if ($aliases.Count -lt 2) { Write-Host "`n  至少要登记两个模型才能配故障转移`n" -ForegroundColor Red; return }
+    Write-Host "`n  给哪个模型设备用模型？（它挂了就用备用的顶上）`n"
+    for ($i = 0; $i -lt $aliases.Count; $i++) {
+        $fb = Get-ModelFallbacks $reg $aliases[$i]
+        $tag = if ($fb.Count) { "  [备用: $($fb -join ' -> ')]" } else { "" }
+        Write-Host ("    {0}. {1,-20}{2}" -f ($i + 1), $aliases[$i], $tag)
+    }
+    Write-Host "    0. 取消`n"
+    $pick = Read-Host "  请选择"
+    if ($pick -eq "0" -or [string]::IsNullOrWhiteSpace($pick)) { return }
+    $idx = 0
+    if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $aliases.Count) {
+        Write-Host "  输入无效" -ForegroundColor Red; return
+    }
+    Set-FallbackInteractive $aliases[$idx - 1]
+}
+
 function Show-ProviderMenu {
     while ($true) {
         Clear-Screen
@@ -691,6 +799,7 @@ function Show-ProviderMenu {
         Write-Host "    5. 删除模型"
         Write-Host "    6. 删除厂商"
         Write-Host "    7. 重新生成配置并重启网关"
+        Write-Host "    8. 设置故障转移  << 主模型挂了自动换备用" -ForegroundColor White
         Write-Host "    0. 返回主菜单"
         Write-Host ""
         $c = Read-Host "  请选择"
@@ -701,6 +810,7 @@ function Show-ProviderMenu {
             "4" { Edit-Provider;     Read-Host "  按回车返回" | Out-Null }
             "5" { Remove-Model;      Read-Host "  按回车返回" | Out-Null }
             "6" { Remove-Provider;   Read-Host "  按回车返回" | Out-Null }
+            "8" { Manage-Fallbacks;  Read-Host "  按回车返回" | Out-Null }
             "7" {
                 $reg = Load-Registry
                 Write-ConfigYaml $reg
@@ -840,6 +950,13 @@ function Remove-GatewayModels([string[]]$aliases) {
     }
     $emptied = @($reg.providers | Where-Object { @($_.models).Count -eq 0 })
     $reg.providers = @($reg.providers | Where-Object { @($_.models).Count -gt 0 })
+    # 被删掉的模型不能再当别人的备用模型，否则配置里会指向一个不存在的名字
+    foreach ($p in $reg.providers) {
+        foreach ($m in @($p.models)) {
+            if ($m.PSObject.Properties.Name -notcontains 'fallbacks') { continue }
+            $m.fallbacks = @($m.fallbacks | Where-Object { $_ -notin $aliases })
+        }
+    }
     Save-Registry $reg
     Write-ConfigYaml $reg
     $after = @(Get-AllAliases $reg).Count
@@ -859,9 +976,20 @@ function Invoke-FailedCleanup($failed) {
     Write-Host ""
     Write-Host "    1. 全部删除（从网关移除，Codex 里也就选不到了）"
     Write-Host "    2. 选择要删的"
+    Write-Host "    3. 不删，给它们配个备用模型（挂了自动顶上）" -ForegroundColor White
     Write-Host "    0. 都不删"
     Write-Host ""
     $c = Read-Host "  请选择"
+
+    if ($c -eq "3") {
+        foreach ($f in @($failed)) {
+            Write-Host ""
+            if (@($failed).Count -eq 1 -or (Confirm "给 $($f.alias) 配备用模型吗？")) {
+                Set-FallbackInteractive $f.alias
+            }
+        }
+        return
+    }
 
     $targets = @()
     switch ($c) {

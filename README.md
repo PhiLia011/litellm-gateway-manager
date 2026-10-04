@@ -180,6 +180,40 @@ Register-ScheduledTask -TaskName "LiteLLM-Gateway" -Action $action -Trigger $tri
 删掉的只是**网关里的登记项**，随时可以在「厂商与模型管理」里加回来。
 如果某个厂商的模型被删光了，它会连厂商一起清理（密钥环境变量保留）。
 
+### 配置故障转移（`4` → `8`）
+
+给任何一个模型配"备用模型"：**主模型报错时（欠费、超时、上游 5xx…）自动改用后面的**，
+按顺序依次尝试。请求不会整个失败。
+
+```
+  给哪个模型设备用模型？（它挂了就用备用的顶上）
+
+    1. deepseek-flash
+    2. deepseek-v4-pro
+    3. qwen3.8-max      [备用: deepseek-flash]
+    4. glm-4.7
+
+  输入序号（多个用逗号分隔，按输入顺序生效）；直接回车 = 清除备用模型
+```
+
+可以配多个兜底，按顺序生效：
+
+```
+  v 已设置：kimi-k3  ->  qwen3.8-max  ->  deepseek-flash
+```
+
+生成到 `config.yaml` 里就是 LiteLLM 原生的 `fallbacks`：
+
+```yaml
+litellm_settings:
+  fallbacks: [{"kimi-k3": ["qwen3.8-max", "deepseek-flash"]}]
+```
+
+**「测试」里也能直接配**：菜单 `2` 测出失败的模型后，除了删掉，还可以选
+`3. 不删，给它们配个备用模型`——欠费的模型留着，让它自动顶到能用的那家。
+
+> 删掉某个模型时，它会自动从其它模型的备用列表里被摘掉，不会留下指向空名字的配置。
+
 ### 清理 Codex App 里的旧模型（`6`）
 
 **Codex App / CLI 的模型选择器读的是 `~/.codex/models.json`**（由 `config.toml`
