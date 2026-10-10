@@ -1110,8 +1110,8 @@ while ($true) {
     Write-Host "    2. 测试每个模型能不能用（失败的可当场清理）"
     Write-Host "    3. 切换 Codex 默认模型"
     Write-Host "    4. 厂商与模型管理  << 加厂商 / 加模型" -ForegroundColor White
-    Write-Host "    5. 密钥管理        << 加 key / 换 key" -ForegroundColor White
-    Write-Host "    6. 清理 Codex App 里的旧模型  << 同步模型列表" -ForegroundColor White
+    Write-Host "    5. API Key管理" -ForegroundColor White
+    Write-Host "    6. 同步模型列表" -ForegroundColor White
     Write-Host "    7. 启动 / 重启网关"
     Write-Host "    8. 停止网关"
     Write-Host "    9. 查看最近日志"
